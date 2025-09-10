@@ -770,10 +770,11 @@ def decompile_function(
         line = ida_lines.tag_remove(sl.line)
         if len(pseudocode) > 0:
             pseudocode += "\n"
-        if not addr:
-            pseudocode += f"/* line: {i} */ {line}"
-        else:
-            pseudocode += f"/* line: {i}, address: {hex(addr)} */ {line}"
+        # if not addr:
+        #     pseudocode += f"/* line: {i} */ {line}"
+        # else:
+        #     pseudocode += f"/* line: {i}, address: {hex(addr)} */ {line}"
+        pseudocode += f"L{i}: {line}"
 
     return pseudocode
 
