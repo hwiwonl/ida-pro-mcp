@@ -780,6 +780,222 @@ def decompile_function(
 
 @jsonrpc
 @idaread
+def get_calltree(
+    func_addr: Annotated[str, "Address of the start function"],
+    idx: Annotated[int, "Target argument index to track (0-based)"],
+) -> str:
+    """Construct a full call tree starting at a function, tracking where the specified argument is used. Includes decompiled pseudocode for each function in the tree. Only direct variable-to-variable assignments are used to propagate aliases; only direct call targets are considered."""
+    start_ea = parse_address(func_addr)
+
+    # Helper: produce pseudocode text identical in style to decompile_function
+    def get_pseudocode_text(ea: int) -> str:
+        cfunc = decompile_checked(ea)
+        if is_window_active():
+            ida_hexrays.open_pseudocode(ea, ida_hexrays.OPF_REUSE)
+        sv = cfunc.get_pseudocode()
+        pseudocode = ""
+        for i, sl in enumerate(sv):
+            sl: ida_kernwin.simpleline_t
+            line = ida_lines.tag_remove(sl.line)
+            if len(pseudocode) > 0:
+                pseudocode += "\n"
+            pseudocode += f"L{i}: {line}"
+        return pseudocode
+
+    # Helper: enumerate argument lvar indices (indices into cfunc.lvars)
+    def get_argument_indices(cfunc: ida_hexrays.cfunc_t) -> list[int]:
+        arg_indices: list[int] = []
+        for i, lvar in enumerate(cfunc.lvars):
+            try:
+                if lvar.is_arg_var:
+                    arg_indices.append(i)
+            except Exception:
+                continue
+        return arg_indices
+
+    # Helper: detect if an expression tree contains any var whose idx is in tracked set
+    def expr_uses_tracked(expr: ida_hexrays.cexpr_t, tracked: set[int]) -> bool:
+        if not expr:
+            return False
+        try:
+            if expr.op == ida_hexrays.cot_var and hasattr(expr, "v") and hasattr(expr.v, "idx"):
+                return expr.v.idx in tracked
+        except Exception:
+            pass
+
+        try:
+            if hasattr(expr, "x") and expr.x and expr_uses_tracked(expr.x, tracked):
+                return True
+            if hasattr(expr, "y") and expr.y and expr_uses_tracked(expr.y, tracked):
+                return True
+            if hasattr(expr, "z") and expr.z and expr_uses_tracked(expr.z, tracked):
+                return True
+            if hasattr(expr, "a") and expr.a:
+                for aexpr in expr.a:
+                    if expr_uses_tracked(aexpr, tracked):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    # Helper: find direct callees where the tracked argument is used; propagate only via var-to-var assignments
+    def find_callees_using_param(func_ea: int, param_arg_index: int) -> list[tuple[int, int]]:
+        callees: list[tuple[int, int]] = []
+        cfunc = decompile_checked(func_ea)
+        arg_indices = get_argument_indices(cfunc)
+        if param_arg_index < 0 or param_arg_index >= len(arg_indices):
+            raise IDAError(f"Invalid argument index {param_arg_index} for function {hex(func_ea)}")
+        tracked: set[int] = {arg_indices[param_arg_index]}
+
+        class Visitor(ida_hexrays.ctree_visitor_t):
+            def __init__(self):
+                ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+
+            def visit_expr(self, e: ida_hexrays.cexpr_t):
+                if not e:
+                    return 0
+
+                # Direct aliasing: dst = src; where src uses tracked var, and dst is a single var
+                if e.op == ida_hexrays.cot_asg:
+                    try:
+                        dst = e.x
+                        src = e.y
+                        if dst and src and dst.op == ida_hexrays.cot_var and hasattr(dst, "v") and hasattr(dst.v, "idx"):
+                            if expr_uses_tracked(src, tracked):
+                                tracked.add(dst.v.idx)
+                    except Exception:
+                        pass
+
+                # Direct calls: record each argument position that uses the tracked var
+                if e.op == ida_hexrays.cot_call:
+                    try:
+                        callee_ea = None
+                        if e.x and e.x.op == ida_hexrays.cot_obj:
+                            callee_ea = e.x.obj_ea
+                        if callee_ea is not None and hasattr(e, "a") and e.a:
+                            for j, arg in enumerate(e.a):
+                                if expr_uses_tracked(arg, tracked):
+                                    callees.append((callee_ea, j))
+                    except Exception:
+                        pass
+
+                return 0
+
+        v = Visitor()
+        v.apply_to(cfunc.body, None)
+        return callees
+
+    visited: set[tuple[int, int]] = set()
+
+    # Store adjacency for overview, and detailed lines separately
+    graph: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    detail_lines: list[str] = []
+
+    def get_func_name(ea: int) -> str:
+        # Raw name
+        name = ""
+        try:
+            fn = idaapi.get_func(ea)
+            if fn:
+                try:
+                    name = fn.get_name()
+                except AttributeError:
+                    name = ida_funcs.get_func_name(fn.start_ea)
+        except Exception:
+            pass
+        if not name:
+            name = idaapi.get_name(ea) or f"sub_{ea:x}"
+
+        # Demangle and keep last identifier component if possible
+        try:
+            demangled = idaapi.demangle_name(name, idaapi.MNG_NODEFINIT)
+            if demangled:
+                # Split on C++ namespace scope if present
+                simple = demangled.split("::")[-1]
+                # Strip function parameters if present
+                paren = simple.find("(")
+                if paren != -1:
+                    simple = simple[:paren]
+                name = simple
+        except Exception:
+            pass
+        return name
+
+    def walk(func_ea: int, param_index: int, depth: int):
+        key = (func_ea, param_index)
+        if key in visited:
+            return
+        visited.add(key)
+
+        indent = "  " * depth
+        name = get_func_name(func_ea)
+        # Render a Markdown heading and fenced code block (no leading indent)
+        detail_lines.append(f"### {name} @ {hex(func_ea)} (tracked param idx: {param_index})")
+        try:
+            pseudocode = get_pseudocode_text(func_ea)
+        except IDAError as e:
+            pseudocode = f"[Decompilation failed: {e.message}]"
+        detail_lines.append("")
+        detail_lines.append("```c")
+        for pl in pseudocode.splitlines():
+            detail_lines.append(pl)
+        detail_lines.append("```")
+        detail_lines.append("")
+
+        try:
+            children = find_callees_using_param(func_ea, param_index)
+        except IDAError:
+            children = []
+
+        normalized_children: list[tuple[int, int]] = []
+        for child_ea, child_param_idx in children:
+            # Normalize to callee start EA if possible
+            fn = idaapi.get_func(child_ea)
+            child_start = fn.start_ea if fn else child_ea
+            normalized_children.append((child_start, child_param_idx))
+
+        graph[key] = normalized_children
+        for child_start, child_param_idx in normalized_children:
+            walk(child_start, child_param_idx, depth + 1)
+
+    # Normalize start to function start
+    start_fn = idaapi.get_func(start_ea)
+    if not start_fn:
+        raise IDAError(f"No function found containing address {hex(start_ea)}")
+    root = (start_fn.start_ea, idx)
+    walk(start_fn.start_ea, idx, 0)
+
+    # Render overview in a "tree"-like format
+    overview_lines: list[str] = []
+
+    def render(node: tuple[int, int], prefix: str = "", is_last: bool = True):
+        ea, pidx = node
+        connector = "└── " if is_last else "├── "
+        line = f"{prefix}{connector}{get_func_name(ea)} @ {hex(ea)} (idx {pidx})"
+        overview_lines.append(line)
+        children = graph.get(node, [])
+        if not children:
+            return
+        new_prefix = prefix + ("    " if is_last else "│   ")
+        for i, child in enumerate(children):
+            render(child, new_prefix, i == len(children) - 1)
+
+    # Root without initial connector like tree(1)
+    overview_lines.append(f"{get_func_name(root[0])} @ {hex(root[0])} (idx {root[1]})")
+    for i, child in enumerate(graph.get(root, [])):
+        render(child, "", i == len(graph.get(root, [])) - 1)
+
+    # Join sections
+    output_lines: list[str] = []
+    output_lines.append("## Overview")
+    output_lines.extend(overview_lines)
+    output_lines.append("")
+    output_lines.append("## Details")
+    output_lines.extend(detail_lines)
+    return "\n".join(output_lines)
+
+@jsonrpc
+@idaread
 def disassemble_function(
     start_address: Annotated[str, "Address of the function to disassemble"],
 ) -> str:
