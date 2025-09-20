@@ -936,7 +936,7 @@ def get_calltree(
         except IDAError as e:
             pseudocode = f"[Decompilation failed: {e.message}]"
         detail_lines.append("")
-        detail_lines.append("```c")
+        detail_lines.append("```cpp")
         for pl in pseudocode.splitlines():
             detail_lines.append(pl)
         detail_lines.append("```")
@@ -971,7 +971,7 @@ def get_calltree(
     def render(node: tuple[int, int], prefix: str = "", is_last: bool = True):
         ea, pidx = node
         connector = "└── " if is_last else "├── "
-        line = f"{prefix}{connector}{get_func_name(ea)} @ {hex(ea)} (idx {pidx})"
+        line = f"{prefix}{connector}`{get_func_name(ea)}` @ {hex(ea)} (idx {pidx})"
         overview_lines.append(line)
         children = graph.get(node, [])
         if not children:
@@ -981,7 +981,7 @@ def get_calltree(
             render(child, new_prefix, i == len(children) - 1)
 
     # Root without initial connector like tree(1)
-    overview_lines.append(f"{get_func_name(root[0])} @ {hex(root[0])} (idx {root[1]})")
+    overview_lines.append(f"`{get_func_name(root[0])}` @ {hex(root[0])} (idx {root[1]})")
     for i, child in enumerate(graph.get(root, [])):
         render(child, "", i == len(graph.get(root, [])) - 1)
 
@@ -989,9 +989,10 @@ def get_calltree(
     output_lines: list[str] = []
     output_lines.append("## Overview")
     output_lines.extend(overview_lines)
-    output_lines.append("")
-    output_lines.append("## Details")
-    output_lines.extend(detail_lines)
+    if len(overview_lines) < 50:
+        output_lines.append("")
+        output_lines.append("## Details")
+        output_lines.extend(detail_lines)
     return "\n".join(output_lines)
 
 @jsonrpc
