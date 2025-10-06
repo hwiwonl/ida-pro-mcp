@@ -1,15 +1,16 @@
 import os
 import sys
 
+
 if sys.version_info < (3, 11):
     raise RuntimeError("Python 3.11 or higher is required for the MCP plugin")
-import re
+import http.server
 import json
 import struct
 import threading
-import http.server
+from typing import Annotated, Any, Callable, Generic, Optional, TypedDict, TypeVar, get_type_hints
 from urllib.parse import urlparse
-from typing import Any, Callable, get_type_hints, TypedDict, Optional, Annotated, TypeVar, Generic
+
 
 class JSONRPCError(Exception):
     def __init__(self, code: int, message: str, data: Any = None):
@@ -155,7 +156,7 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
                 "code": -32000,
                 "message": e.message,
             }
-        except Exception as e:
+        except Exception:
             traceback.print_exc()
             response["error"] = {
                 "code": -32603,
@@ -165,7 +166,7 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
 
         try:
             response_body = json.dumps(response).encode("utf-8")
-        except Exception as e:
+        except Exception:
             traceback.print_exc()
             response_body = json.dumps({
                 "error": {
@@ -239,30 +240,29 @@ class Server:
 # A module that helps with writing thread safe ida code.
 # Based on:
 # https://web.archive.org/web/20160305190440/http://www.williballenthin.com/blog/2015/09/04/idapython-synchronization-decorator/
+import functools
 import logging
 import queue
 import traceback
-import functools
 
-import ida_hexrays
-import ida_kernwin
-import ida_funcs
-import ida_gdl
-import ida_lines
-import ida_idaapi
-import idc
-import idaapi
-import idautils
-import ida_nalt
 import ida_bytes
+import ida_dbg
+import ida_entry
+import ida_funcs
+import ida_hexrays
+import ida_ida
+import ida_idaapi
+import ida_idd
+import ida_kernwin
+import ida_lines
+import ida_nalt
+import ida_name
 import ida_typeinf
 import ida_xref
-import ida_entry
+import idaapi
 import idautils
-import ida_idd
-import ida_dbg
-import ida_name
-import ida_ida
+import idc
+
 
 class IDAError(Exception):
     def __init__(self, message: str):
@@ -340,7 +340,7 @@ def sync_wrapper(ff, safety_mode: IDASafety):
             call_stack.get()
             #logger.debug('Finished runned')
 
-    ret_val = idaapi.execute_sync(runned, safety_mode)
+    idaapi.execute_sync(runned, safety_mode)
     res = res_container.get()
     if isinstance(res, Exception):
         raise res
@@ -718,7 +718,7 @@ def list_local_types():
                 else:
                     simple_decl = tif._print(None, ida_typeinf.PRTYPE_1LINE | ida_typeinf.PRTYPE_TYPE | ida_typeinf.PRTYPE_SEMI)
                     if simple_decl:
-                        locals.append(f"  Simple declaration:\n{simple_decl}")  
+                        locals.append(f"  Simple declaration:\n{simple_decl}")
             else:
                 message = f"\nType #{ordinal}: Failed to retrieve information."
                 if error.str:
@@ -759,12 +759,11 @@ def decompile_function(
     for i, sl in enumerate(sv):
         sl: ida_kernwin.simpleline_t
         item = ida_hexrays.ctree_item_t()
-        addr = None if i > 0 else cfunc.entry_ea
         if cfunc.get_line_item(sl.line, 0, False, None, item, None):
             ds = item.dstr().split(": ")
             if len(ds) == 2:
                 try:
-                    addr = int(ds[0], 16)
+                    int(ds[0], 16)
                 except ValueError:
                     pass
         line = ida_lines.tag_remove(sl.line)
@@ -887,9 +886,12 @@ def get_calltree(
 
     visited: set[tuple[int, int]] = set()
 
-    # Store adjacency for overview, and detailed lines separately
+    # Store adjacency for overview
     graph: dict[tuple[int, int], list[tuple[int, int]]] = {}
-    detail_lines: list[str] = []
+    # Store decompiled code for each function (deduplicated by address)
+    decompiled_funcs: dict[int, tuple[str, str]] = {}  # ea -> (name, pseudocode)
+    # Track functions where decompilation failed
+    failed_funcs: set[int] = set()
 
     def get_func_name(ea: int) -> str:
         # Raw name
@@ -927,20 +929,14 @@ def get_calltree(
             return
         visited.add(key)
 
-        indent = "  " * depth
-        name = get_func_name(func_ea)
-        # Render a Markdown heading and fenced code block (no leading indent)
-        detail_lines.append(f"### {name} @ {hex(func_ea)} (tracked param idx: {param_index})")
-        try:
-            pseudocode = get_pseudocode_text(func_ea)
-        except IDAError as e:
-            pseudocode = f"[Decompilation failed: {e.message}]"
-        detail_lines.append("")
-        detail_lines.append("```cpp")
-        for pl in pseudocode.splitlines():
-            detail_lines.append(pl)
-        detail_lines.append("```")
-        detail_lines.append("")
+        # Try to decompile and store (only once per function address)
+        if func_ea not in decompiled_funcs and func_ea not in failed_funcs:
+            name = get_func_name(func_ea)
+            try:
+                pseudocode = get_pseudocode_text(func_ea)
+                decompiled_funcs[func_ea] = (name, pseudocode)
+            except IDAError:
+                failed_funcs.add(func_ea)
 
         try:
             children = find_callees_using_param(func_ea, param_index)
@@ -965,34 +961,45 @@ def get_calltree(
     root = (start_fn.start_ea, idx)
     walk(start_fn.start_ea, idx, 0)
 
-    # Render overview in a "tree"-like format
-    overview_lines: list[str] = []
-
-    def render(node: tuple[int, int], prefix: str = "", is_last: bool = True):
+    # Build JSON structure for overview
+    def build_json_tree(node: tuple[int, int]) -> dict:
         ea, pidx = node
-        connector = "└── " if is_last else "├── "
-        line = f"{prefix}{connector}`{get_func_name(ea)}` @ {hex(ea)} (idx {pidx})"
-        overview_lines.append(line)
+        name = get_func_name(ea)
+        node_dict = {
+            "function": name,
+            "address": hex(ea),
+            "tracked_param_idx": pidx,
+            "decompilation_available": ea in decompiled_funcs,
+            "callees": []
+        }
         children = graph.get(node, [])
-        if not children:
-            return
-        new_prefix = prefix + ("    " if is_last else "│   ")
-        for i, child in enumerate(children):
-            render(child, new_prefix, i == len(children) - 1)
+        for child in children:
+            node_dict["callees"].append(build_json_tree(child))
+        return node_dict
 
-    # Root without initial connector like tree(1)
-    overview_lines.append(f"`{get_func_name(root[0])}` @ {hex(root[0])} (idx {root[1]})")
-    for i, child in enumerate(graph.get(root, [])):
-        render(child, "", i == len(graph.get(root, [])) - 1)
+    overview_json = build_json_tree(root)
 
-    # Join sections
+    # Build output
     output_lines: list[str] = []
     output_lines.append("## Overview")
-    output_lines.extend(overview_lines)
-    if len(overview_lines) < 50:
+    output_lines.append("")
+    output_lines.append("```json")
+    output_lines.append(json.dumps(overview_json, indent=2))
+    output_lines.append("```")
+    output_lines.append("")
+
+    # Add decompiled code for all successfully decompiled functions
+    if decompiled_funcs:
+        output_lines.append("## Decompiled Functions")
         output_lines.append("")
-        output_lines.append("## Details")
-        output_lines.extend(detail_lines)
+        for func_ea, (func_name, pseudocode) in decompiled_funcs.items():
+            output_lines.append(f"### {func_name} @ {hex(func_ea)}")
+            output_lines.append("")
+            output_lines.append("```cpp")
+            output_lines.append(pseudocode)
+            output_lines.append("```")
+            output_lines.append("")
+
     return "\n".join(output_lines)
 
 @jsonrpc
@@ -1194,9 +1201,9 @@ def set_global_variable_type(
     ea = idaapi.get_name_ea(idaapi.BADADDR, variable_name)
     tif = ida_typeinf.tinfo_t(new_type, None, ida_typeinf.PT_SIL)
     if not tif:
-        raise IDAError(f"Parsed declaration is not a variable type")
+        raise IDAError("Parsed declaration is not a variable type")
     if not ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.PT_SIL):
-        raise IDAError(f"Failed to apply type")
+        raise IDAError("Failed to apply type")
 
 @jsonrpc
 @idawrite
@@ -1225,11 +1232,11 @@ def set_function_prototype(
     try:
         tif = ida_typeinf.tinfo_t(prototype, None, ida_typeinf.PT_SIL)
         if not tif.is_func():
-            raise IDAError(f"Parsed declaration is not a function type")
+            raise IDAError("Parsed declaration is not a function type")
         if not ida_typeinf.apply_tinfo(func.start_ea, tif, ida_typeinf.PT_SIL):
-            raise IDAError(f"Failed to apply type")
+            raise IDAError("Failed to apply type")
         refresh_decompiler_ctext(func.start_ea)
-    except Exception as e:
+    except Exception:
         raise IDAError(f"Failed to parse prototype string: {prototype}")
 
 class my_modifier_t(ida_hexrays.user_lvar_modifier_t):
@@ -1399,7 +1406,7 @@ def dbg_get_call_stack() -> list[dict[str, str]]:
 
             callstack.append(frame_info)
 
-    except Exception as e:
+    except Exception:
         pass
     return callstack
 
