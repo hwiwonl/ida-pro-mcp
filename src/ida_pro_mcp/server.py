@@ -1,16 +1,17 @@
-import os
-import sys
-import ast
-import json
-import shutil
 import argparse
+import ast
 import http.client
+import json
+import os
+import shutil
+import sys
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 
+
 # The log_level is necessary for Cline to work: https://github.com/jlowin/fastmcp/issues/81
-mcp = FastMCP("github.com/mrexodia/ida-pro-mcp", log_level="ERROR")
+mcp = FastMCP("github.com/hwiwonl/ida-pro-mcp", log_level="ERROR")
 
 jsonrpc_request_id = 1
 ida_host = "127.0.0.1"
@@ -60,7 +61,7 @@ def check_connection() -> str:
     try:
         metadata = make_jsonrpc_request("get_metadata")
         return f"Successfully connected to IDA Pro (open file: {metadata['module']})"
-    except Exception as e:
+    except Exception:
         if sys.platform == "darwin":
             shortcut = "Ctrl+Option+M"
         else:
@@ -185,7 +186,7 @@ SAFE_FUNCTIONS = [f for f in visitor.functions.keys() if f not in UNSAFE_FUNCTIO
 
 def generate_readme():
     print("README:")
-    print(f"- `check_connection()`: Check if the IDA plugin is running.")
+    print("- `check_connection()`: Check if the IDA plugin is running.")
     def get_description(name: str):
         function = visitor.functions[name]
         signature = function.name + "("
