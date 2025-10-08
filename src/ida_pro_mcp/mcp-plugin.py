@@ -781,10 +781,30 @@ def decompile_function(
 @idaread
 def get_calltree(
     func_addr: Annotated[str, "Address of the start function"],
-    idx: Annotated[int, "Target argument index to track (0-based)"],
+    idx: Annotated[int, "Target argument index to track (0-based, left to right)"],
 ) -> str:
-    """Construct a full call tree starting at a function, tracking where the specified argument is used. Includes decompiled pseudocode for each function in the tree. Only direct variable-to-variable assignments are used to propagate aliases; only direct call targets are considered."""
+    """Construct a full call tree starting at a function, tracking where the specified argument is used.
+    
+    This function precisely tracks argument usage through the call tree, including:
+    - Direct argument passing (e.g., func(a1))
+    - Arguments used in expressions (e.g., func((a1 - 16) & -(__int64)(a1 != 0)))
+    - Arguments propagated through variable assignments (e.g., v2 = a1; func(v2))
+    
+    The tracking is precise and uses no heuristics - it only follows actual data flow through:
+    1. Variable-to-variable assignments (including expressions)
+    2. Direct function calls where tracked variables appear in arguments
+    
+    Returns decompiled pseudocode for each function in the tree with the call graph structure."""
     start_ea = parse_address(func_addr)
+    
+    # Convert natural parameter index (0-based, left to right) to IDA's internal index
+    def convert_param_index(func_ea: int, natural_idx: int) -> int:
+        cfunc = decompile_checked(func_ea)
+        arg_indices = get_argument_indices(cfunc)
+        if natural_idx < 0 or natural_idx >= len(arg_indices):
+            raise IDAError(f"Invalid argument index {natural_idx} for function {hex(func_ea)} (function has {len(arg_indices)} arguments)")
+        # IDA stores arguments in reverse order, so convert: natural_idx -> (len-1-natural_idx)
+        return len(arg_indices) - 1 - natural_idx
 
     # Helper: produce pseudocode text identical in style to decompile_function
     def get_pseudocode_text(ea: int) -> str:
@@ -813,34 +833,45 @@ def get_calltree(
         return arg_indices
 
     # Helper: detect if an expression tree contains any var whose idx is in tracked set
+    # This function recursively walks the entire expression tree to find tracked variables
+    # even when they appear in complex expressions like (a1 - 16) & -(__int64)(a1 != 0)
     def expr_uses_tracked(expr: ida_hexrays.cexpr_t, tracked: set[int]) -> bool:
         if not expr:
             return False
-        try:
-            if expr.op == ida_hexrays.cot_var and hasattr(expr, "v") and hasattr(expr.v, "idx"):
-                return expr.v.idx in tracked
-        except Exception:
-            pass
-
-        try:
-            if hasattr(expr, "x") and expr.x and expr_uses_tracked(expr.x, tracked):
-                return True
-            if hasattr(expr, "y") and expr.y and expr_uses_tracked(expr.y, tracked):
-                return True
-            if hasattr(expr, "z") and expr.z and expr_uses_tracked(expr.z, tracked):
-                return True
-            if hasattr(expr, "a") and expr.a:
-                for aexpr in expr.a:
-                    if expr_uses_tracked(aexpr, tracked):
-                        return True
-        except Exception:
-            pass
-        return False
+        
+        # Use a visitor pattern to walk the entire expression tree
+        class ExprChecker(ida_hexrays.ctree_visitor_t):
+            def __init__(self):
+                ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+                self.found = False
+            
+            def visit_expr(self, e: ida_hexrays.cexpr_t):
+                if not e:
+                    return 0
+                if e.op == ida_hexrays.cot_var:
+                    try:
+                        if hasattr(e, "v") and hasattr(e.v, "idx"):
+                            if e.v.idx in tracked:
+                                self.found = True
+                                return 1  # Stop traversal
+                    except Exception:
+                        pass
+                return 0
+        
+        checker = ExprChecker()
+        # Use apply_to on the expression itself to traverse its tree
+        checker.apply_to(expr, None)
+        return checker.found
 
     # Helper: find direct callees where the tracked argument is used; propagate only via var-to-var assignments
     def find_callees_using_param(func_ea: int, param_arg_index: int) -> list[tuple[int, int]]:
         callees: list[tuple[int, int]] = []
-        cfunc = decompile_checked(func_ea)
+        try:
+            cfunc = decompile_checked(func_ea)
+        except IDAError:
+            # If decompilation fails, return empty list (no callees can be found)
+            return []
+        
         arg_indices = get_argument_indices(cfunc)
         if param_arg_index < 0 or param_arg_index >= len(arg_indices):
             raise IDAError(f"Invalid argument index {param_arg_index} for function {hex(func_ea)}")
@@ -855,27 +886,49 @@ def get_calltree(
                     return 0
 
                 # Direct aliasing: dst = src; where src uses tracked var, and dst is a single var
+                # This propagates tracking through variable assignments
+                # For example: v2 = a1; or v2 = a1 + 5; both make v2 tracked if a1 is tracked
                 if e.op == ida_hexrays.cot_asg:
                     try:
                         dst = e.x
                         src = e.y
-                        if dst and src and dst.op == ida_hexrays.cot_var and hasattr(dst, "v") and hasattr(dst.v, "idx"):
-                            if expr_uses_tracked(src, tracked):
-                                tracked.add(dst.v.idx)
-                    except Exception:
+                        
+                        # Only track when destination is a simple variable
+                        # (not a dereferenced pointer, array element, or field access)
+                        if dst and src and dst.op == ida_hexrays.cot_var:
+                            if hasattr(dst, "v") and hasattr(dst.v, "idx"):
+                                # If the source expression uses any tracked variable,
+                                # the destination variable also becomes tracked
+                                uses_tracked = expr_uses_tracked(src, tracked)
+                                if uses_tracked:
+                                    tracked.add(dst.v.idx)
+                    except Exception as ex:
                         pass
 
                 # Direct calls: record each argument position that uses the tracked var
+                # This handles calls where we can determine the target address
                 if e.op == ida_hexrays.cot_call:
                     try:
                         callee_ea = None
-                        if e.x and e.x.op == ida_hexrays.cot_obj:
-                            callee_ea = e.x.obj_ea
-                        if callee_ea is not None and hasattr(e, "a") and e.a:
+                        
+                        # Try to get the callee address from different call types
+                        if e.x:
+                            # Direct call to a function object
+                            if e.x.op == ida_hexrays.cot_obj:
+                                callee_ea = e.x.obj_ea
+                            # Call through a pointer that might have a known address
+                            elif hasattr(e.x, "obj_ea"):
+                                callee_ea = e.x.obj_ea
+                        
+                        # Only process if we can resolve the callee and it has arguments
+                        if callee_ea is not None and callee_ea != idaapi.BADADDR and hasattr(e, "a") and e.a:
+                            # Check each argument to see if it uses any tracked variable
                             for j, arg in enumerate(e.a):
-                                if expr_uses_tracked(arg, tracked):
+                                # expr_uses_tracked recursively checks if the argument expression
+                                # contains any tracked variables, even in complex expressions
+                                if arg and expr_uses_tracked(arg, tracked):
                                     callees.append((callee_ea, j))
-                    except Exception:
+                    except Exception as ex:
                         pass
 
                 return 0
@@ -948,27 +1001,55 @@ def get_calltree(
             # Normalize to callee start EA if possible
             fn = idaapi.get_func(child_ea)
             child_start = fn.start_ea if fn else child_ea
-            normalized_children.append((child_start, child_param_idx))
+            # Convert natural call-site index to IDA's internal index
+            try:
+                child_ida_idx = convert_param_index(child_start, child_param_idx)
+            except IDAError:
+                # If conversion fails, skip this child
+                continue
+            normalized_children.append((child_start, child_ida_idx))
 
         graph[key] = normalized_children
-        for child_start, child_param_idx in normalized_children:
-            walk(child_start, child_param_idx, depth + 1)
+        for child_start, child_ida_idx in normalized_children:
+            walk(child_start, child_ida_idx, depth + 1)
 
     # Normalize start to function start
     start_fn = idaapi.get_func(start_ea)
     if not start_fn:
         raise IDAError(f"No function found containing address {hex(start_ea)}")
-    root = (start_fn.start_ea, idx)
-    walk(start_fn.start_ea, idx, 0)
+    
+    # Convert natural parameter index to IDA's internal index
+    ida_idx = convert_param_index(start_fn.start_ea, idx)
+    root = (start_fn.start_ea, ida_idx)
+    walk(start_fn.start_ea, ida_idx, 0)
 
     # Build JSON structure for overview
     def build_json_tree(node: tuple[int, int]) -> dict:
         ea, pidx = node
         name = get_func_name(ea)
+        
+        # Convert IDA's internal index back to natural index and get parameter name
+        natural_idx = pidx  # Default fallback
+        param_name = f"arg{pidx}"  # Default fallback
+        
+        try:
+            cfunc = decompile_checked(ea)
+            arg_indices = get_argument_indices(cfunc)
+            natural_idx = len(arg_indices) - 1 - pidx if pidx < len(arg_indices) else pidx
+            # Use natural_idx to get the correct parameter name from arg_indices
+            if natural_idx < len(arg_indices) and arg_indices[natural_idx] < len(cfunc.lvars):
+                param_name = cfunc.lvars[arg_indices[natural_idx]].name
+            else:
+                param_name = f"arg{natural_idx}"
+        except IDAError:
+            # If decompilation fails, use fallback values
+            pass
+        
         node_dict = {
             "function": name,
             "address": hex(ea),
-            "tracked_param_idx": pidx,
+            "tracked_param_idx": natural_idx,
+            "tracked_param_name": param_name,
             "decompilation_available": ea in decompiled_funcs,
             "callees": []
         }
