@@ -782,8 +782,9 @@ def decompile_function(
 def get_calltree(
     func_addr: Annotated[str, "Address of the start function"],
     idx: Annotated[int, "Target argument index to track (0-based, left to right)"],
+    depth: Annotated[int, "Maximum depth of the call tree to explore (default: 4)"] = 4,
 ) -> str:
-    """Construct a full call tree starting at a function, tracking where the specified argument is used.
+    """Construct a call tree starting at a function, tracking where the specified argument is used.
     
     This function precisely tracks argument usage through the call tree, including:
     - Direct argument passing (e.g., func(a1))
@@ -793,6 +794,11 @@ def get_calltree(
     The tracking is precise and uses no heuristics - it only follows actual data flow through:
     1. Variable-to-variable assignments (including expressions)
     2. Direct function calls where tracked variables appear in arguments
+    
+    Args:
+        func_addr: Address of the start function
+        idx: Target argument index to track (0-based, left to right)
+        depth: Maximum depth of the call tree to explore (default: 4)
     
     Returns decompiled pseudocode for each function in the tree with the call graph structure."""
     start_ea = parse_address(func_addr)
@@ -976,11 +982,15 @@ def get_calltree(
             pass
         return name
 
-    def walk(func_ea: int, param_index: int, depth: int):
+    def walk(func_ea: int, param_index: int, current_depth: int):
         key = (func_ea, param_index)
         if key in visited:
             return
         visited.add(key)
+        
+        # Stop recursion if we've reached the maximum depth
+        if current_depth >= depth:
+            return
 
         # Try to decompile and store (only once per function address)
         if func_ea not in decompiled_funcs and func_ea not in failed_funcs:
@@ -1011,7 +1021,7 @@ def get_calltree(
 
         graph[key] = normalized_children
         for child_start, child_ida_idx in normalized_children:
-            walk(child_start, child_ida_idx, depth + 1)
+            walk(child_start, child_ida_idx, current_depth + 1)
 
     # Normalize start to function start
     start_fn = idaapi.get_func(start_ea)
