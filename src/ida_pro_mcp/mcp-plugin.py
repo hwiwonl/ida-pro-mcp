@@ -746,7 +746,7 @@ def decompile_checked(address: int) -> ida_hexrays.cfunc_t:
 
 @jsonrpc
 @idaread
-def decompile_function(
+def decompile_function_addr(
     address: Annotated[str, "Address of the function to decompile"],
 ) -> str:
     """Decompile a function at the given address"""
@@ -769,12 +769,51 @@ def decompile_function(
         line = ida_lines.tag_remove(sl.line)
         if len(pseudocode) > 0:
             pseudocode += "\n"
-        # if not addr:
-        #     pseudocode += f"/* line: {i} */ {line}"
-        # else:
-        #     pseudocode += f"/* line: {i}, address: {hex(addr)} */ {line}"
+
         pseudocode += f"L{i}: {line}"
 
+    return pseudocode
+
+@jsonrpc
+@idaread
+def decompile_function_name(
+    name: Annotated[str, "Full name of the function including the module name to decompile"],
+) -> str:
+    """Decompile a function by name"""
+    # Find function by name
+    function_address = idaapi.get_name_ea(idaapi.BADADDR, name)
+    if function_address == idaapi.BADADDR:
+        # If map has not been created yet, create it
+        if len(DEMANGLED_TO_EA) == 0:
+            create_demangled_to_ea_map()
+        # Try to find the function in the map, else raise an error
+        if name in DEMANGLED_TO_EA:
+            function_address = DEMANGLED_TO_EA[name]
+        else:
+            raise IDAError(f"No function found with name {name}")
+    
+    # Decompile the function
+    address = function_address
+    cfunc = decompile_checked(address)
+    if is_window_active():
+        ida_hexrays.open_pseudocode(address, ida_hexrays.OPF_REUSE)
+    sv = cfunc.get_pseudocode()
+    pseudocode = ""
+    for i, sl in enumerate(sv):
+        sl: ida_kernwin.simpleline_t
+        item = ida_hexrays.ctree_item_t()
+        if cfunc.get_line_item(sl.line, 0, False, None, item, None):
+            ds = item.dstr().split(": ")
+            if len(ds) == 2:
+                try:
+                    int(ds[0], 16)
+                except ValueError:
+                    pass
+        line = ida_lines.tag_remove(sl.line)
+        if len(pseudocode) > 0:
+            pseudocode += "\n"
+        pseudocode += f"L{i}: {line}"
+    
     return pseudocode
 
 @jsonrpc
